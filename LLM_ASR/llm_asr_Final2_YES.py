@@ -19,6 +19,9 @@ import datetime
 import asyncio
 import websockets
 
+# 消息队列管理器
+from message_queue_manager import init_message_queue, send_asr_result, close_message_queue
+
 
 # ---------------- WebSocket 服务端管理类 ----------------
 class WebSocketServerManager:
@@ -942,11 +945,32 @@ class AudioStreamProcessor:
                 # 正常导出模式
                 self.current_client.export_results_to_txt(output_txt)
 
-            # 通过WebSocket广播识别结果
+            # 读取转写结果内容
             try:
                 with open(output_txt, 'r', encoding='utf-8') as f:
                     content = f.read()
+            except Exception as e:
+                print(f"【读取结果文件失败】{e}")
+                return False
 
+            # 1. 首先发送到消息队列（新增逻辑）
+            try:
+                mq_success = send_asr_result(
+                    content=content,
+                    filename=os.path.basename(output_txt),
+                    reason=reason,
+                    force=force,
+                    stream_id=stream_id
+                )
+                if mq_success:
+                    print(f"【消息队列推送】ASR结果已发送到消息队列: {os.path.basename(output_txt)}")
+                else:
+                    print(f"【消息队列推送】ASR结果发送到消息队列失败: {os.path.basename(output_txt)}")
+            except Exception as e:
+                print(f"【消息队列推送异常】{e}")
+
+            # 2. 然后通过WebSocket广播识别结果（原有逻辑）
+            try:
                 # 构建推送消息
                 push_message = {
                     "type": "asr_result",
@@ -1533,7 +1557,24 @@ if __name__ == "__main__":
     print("ASR实时转写系统 - 后端服务器")
     print("=" * 80)
 
-    # 1. 启动WebSocket服务器（用于前端连接）
+    # 1. 初始化消息队列（新增）
+    print("\n【系统启动】正在初始化消息队列...")
+    mq_backend = os.getenv('MQ_BACKEND', 'file')  # 默认使用文件队列
+    mq_config = {
+        "queue_dir": os.path.join(os.path.dirname(__file__), 'outputs'),  # 使用outputs文件夹作为消息队列目录
+        "host": os.getenv('MQ_HOST', 'localhost'),
+        "port": int(os.getenv('MQ_PORT', '6379')),
+        "password": os.getenv('MQ_PASSWORD', None)
+    }
+
+    if init_message_queue(mq_backend, **mq_config):
+        print(f"【系统启动】消息队列初始化成功: {mq_backend}")
+        print(f"【系统启动】消息队列配置: {mq_config}")
+    else:
+        print("【系统启动】消息队列初始化失败，但ASR功能仍可正常使用")
+        print("【系统启动】结果将仅保存到文件和WebSocket，无法推送到消息队列")
+
+    # 2. 启动WebSocket服务器（用于前端连接）
     print("\n【系统启动】正在启动WebSocket服务器...")
     if ws_server_manager.start_server():
         print("【系统启动】WebSocket服务器启动成功")
@@ -1542,9 +1583,9 @@ if __name__ == "__main__":
         print("【系统启动】前端可通过此地址连接获取ASR结果")
     else:
         print("【系统启动】WebSocket服务器启动失败，但ASR功能仍可正常使用")
-        print("【系统启动】结果将仅保存到文件，无法推送到前端")
+        print("【系统启动】结果将仅保存到文件和消息队列，无法推送到前端")
 
-    # 2. 从控制台获取密钥信息：https://console.xfyun.cn/services/rta_new
+    # 3. 从控制台获取密钥信息：https://console.xfyun.cn/services/rta_new
     APP_ID = "4520e15c"
     ACCESS_KEY_ID = "e4e89b97b933bd6f2c7b143d0d8d8dae"
     ACCESS_KEY_SECRET = "NTdkOTUzMmIyMGIxY2NjOGYxYjhhMGNh"
@@ -1553,7 +1594,7 @@ if __name__ == "__main__":
     print(f"【系统配置】APP_ID: {APP_ID}")
     print(f"【系统配置】ACCESS_KEY_ID: {ACCESS_KEY_ID[:8]}...")
 
-    # 3. 执行核心流程：使用多音频流处理模式
+    # 4. 执行核心流程：使用多音频流处理模式
     input_dir = os.path.join(os.path.dirname(__file__), 'input_chunks')
     output_dir = os.path.join(os.path.dirname(__file__), 'outputs')
     os.makedirs(input_dir, exist_ok=True)
@@ -1562,7 +1603,7 @@ if __name__ == "__main__":
     print(f"\n【系统配置】输入目录: {input_dir}")
     print(f"【系统配置】输出目录: {output_dir}")
 
-    # 4. 初始化音频流处理器（设置30秒超时）
+    # 5. 初始化音频流处理器（设置30秒超时）
     processor = AudioStreamProcessor(APP_ID, ACCESS_KEY_ID, ACCESS_KEY_SECRET, input_dir, output_dir,
                                      timeout_seconds=30)
 
@@ -1570,7 +1611,7 @@ if __name__ == "__main__":
     print(f"【系统启动】超时时间: 30秒")
     print(f"【系统启动】最大重连次数: 3次")
 
-    # 5. 显示系统状态
+    # 6. 显示系统状态
     ws_status = ws_server_manager.get_status()
     print(f"\n【系统状态】WebSocket服务器: {'运行中' if ws_status['is_running'] else '未运行'}")
     print(f"【系统状态】当前连接数: {ws_status['client_count']}")
@@ -1583,13 +1624,16 @@ if __name__ == "__main__":
     print("=" * 80)
 
     try:
-        # 6. 启动多音频流处理模式
+        # 7. 启动多音频流处理模式
         processor.run_multi_stream_processing()
     except KeyboardInterrupt:
         print("\n【系统关闭】用户手动中断")
     except Exception as e:
         print(f"\n【系统错误】致命异常: {e}")
     finally:
-        print("\n【系统关闭】正在关闭WebSocket服务器...")
+        print("\n【系统关闭】正在关闭系统...")
+        # 关闭WebSocket服务器
         ws_server_manager.stop_server()
+        # 关闭消息队列
+        close_message_queue()
         print("【系统关闭】系统已安全关闭")
